@@ -84,7 +84,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         mut plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DataFusionResult<Transformed<LogicalPlan>> {
-        // Only process aggregates
+        // Process only Aggregate plans.
         let LogicalPlan::Aggregate(agg) = &plan else {
             return Ok(Transformed::no(plan));
         };
@@ -93,6 +93,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         let agg_input = input.as_ref().clone();
         let mut temporal_group_bys = group_expr.iter().filter_map(|e| self.find_temporal_group_by(e));
         let temporal_group_by = temporal_group_bys.next();
+
         if temporal_group_bys.next().is_some() {
             self.log.info(
                 &fingerprint,
@@ -111,7 +112,8 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                 DynamicLowerBound::Found(bin_expr) => Some(bin_expr),
                 DynamicLowerBound::Stable => None,
                 _ => {
-                    self.log.info(&fingerprint, "found an unstable expression, caching not possible")?;
+                    self.log
+                        .info(&fingerprint, "found an unstable expression, caching not possible")?;
                     return Ok(Transformed::no(plan));
                 }
             };
@@ -190,6 +192,18 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
     }
 }
 
+/// Implement DisplayAs for the logical extension node so that its explain formatting covers all cases.
+impl DisplayAs for QCAggregatePlanNode {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default => write!(f, "QueryCacheAggregate: {}", self.fingerprint),
+            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => write!(f, "{self:?}"),
+            _ => write!(f, "{self:?}"),
+        }
+    }
+}
+
+/// Logical extension node for a cached aggregation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 struct QCAggregatePlanNode {
     input: LogicalPlan,
@@ -200,7 +214,7 @@ struct QCAggregatePlanNode {
 
 impl fmt::Display for QCAggregatePlanNode {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        // Delegate to our custom explain formatter
+        // Delegate to the DisplayAs implementation via the helper function.
         UserDefinedLogicalNodeCore::fmt_for_explain(self, f)
     }
 }
@@ -430,7 +444,7 @@ fn with_lower_bound(
     )?))
 }
 
-/// Check for an existing QC inner aggregate exec in the plan.
+/// Check for an existing inner aggregate exec in the plan.
 fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
     match plan.name() {
         "QueryCacheAggregateExec" => true,
@@ -710,7 +724,7 @@ impl DynamicLowerBound {
             | Operator::Divide
             | Operator::Modulo => (),
             _ => return Self::Abandon,
-        };
+        }
         let left = Self::find(left, columns);
         let right = Self::find(right, columns);
         left.either(right)
