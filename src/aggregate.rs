@@ -197,8 +197,8 @@ impl DisplayAs for QCAggregatePlanNode {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "QueryCacheAggregate: {}", self.fingerprint),
-            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => write!(f, "{self:?}"),
-            _ => write!(f, "{self:?}"),
+            DisplayFormatType::Verbose => write!(f, "{self:?}"),
+            DisplayFormatType::TreeRender => write!(f, "QueryCacheAggregate: {}", self.input.display()),
         }
     }
 }
@@ -494,8 +494,8 @@ impl DisplayAs for CacheUpdateAggregateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
-            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => write!(f, "{self:?}"),
-            _ => write!(f, "{self:?}"),
+            DisplayFormatType::Verbose => write!(f, "{self:?}"),
+            DisplayFormatType::TreeRender => write!(f, "{}({})", self.name(), self.input.name()),
         }
     }
 }
@@ -585,8 +585,8 @@ impl DisplayAs for CachedAggregateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}", self.name()),
-            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => write!(f, "{self:?}"),
-            _ => write!(f, "{self:?}"),
+            DisplayFormatType::Verbose => write!(f, "{self:?}"),
+            DisplayFormatType::TreeRender => write!(f, "{}", self.name()),
         }
     }
 }
