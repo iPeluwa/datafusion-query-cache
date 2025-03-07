@@ -66,7 +66,6 @@ impl<Log: AbstractLog> QCAggregateOptimizerRule<Log> {
         None
     }
 }
-
 impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
     fn name(&self) -> &str {
         "query-cache-agg-group-by"
@@ -76,12 +75,15 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         Some(ApplyOrder::BottomUp)
     }
 
+    // Example rewrite pass to insert a user defined LogicalPlanNode
     fn rewrite(
         &self,
         mut plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DataFusionResult<Transformed<LogicalPlan>> {
+        // println!("rewrite -> {}", plan.display());
         let LogicalPlan::Aggregate(agg) = &plan else {
+            // not an aggregation, continue rewrite
             return Ok(Transformed::no(plan));
         };
         let mut fingerprint = plan.display_indent_schema().to_string();
@@ -93,6 +95,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         let temporal_group_by = temporal_group_bys.next();
 
         if temporal_group_bys.next().is_some() {
+            // I've no idea if this is even possible, and what we could do if it is, do nothing for now
             self.log.info(
                 &fingerprint,
                 "multiple group bys using temporal columns, caching not possible!",
@@ -111,6 +114,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                 DynamicLowerBound::Found(bin_expr) => Some(bin_expr),
                 DynamicLowerBound::Stable => None,
                 _ => {
+                    // we found an unstable expression, we can't rewrite the plan
                     self.log
                         .info(&fingerprint, "we found an unstable expression, caching not possible")?;
                     return Ok(Transformed::no(plan));
@@ -122,11 +126,14 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         };
 
         if temporal_group_by.is_none() {
+            // if temporal_group_by is none, we need to make sure the sort column is in the projection
             let LogicalPlan::TableScan(scan) = input else {
+                // TODO we need to support this, e.g. a subquery
                 self.log
                     .info(&fingerprint, "input not a table scan, caching not possible")?;
                 return Ok(Transformed::no(plan));
             };
+            // TODO check table name
             let field_name = self.config.default_temporal_column().name.clone();
             if !scan.projected_schema.fields().iter().any(|f| f.name() == &field_name) {
                 let new_col_id = scan
@@ -152,10 +159,10 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                 new_projection.sort_unstable();
 
                 let new_table_scan = TableScan::try_new(
-                    scan.table_name.clone(), // Updated for DataFusion 39.0
-                    scan.source.clone(),
+                    scan.table_name,
+                    scan.source,
                     Some(new_projection),
-                    scan.filters.clone(),
+                    scan.filters,
                     scan.fetch,
                 )
                 .map(LogicalPlan::TableScan)?;
@@ -174,12 +181,20 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             }
         }
 
+        // if dynamic_lower_bound.is_some() && temporal_group_by.is_none() {
+        //     self.log.info(
+        //         &fingerprint,
+        //         "found a dynamic lower bound but no temporal group by, caching not possible",
+        //     )?;
+        //     return Ok(Transformed::no(plan));
+        // }
         if dynamic_lower_bound.is_some() {
             return plan_err!("dynamic lower bound not yet supported");
         }
 
         let temporal_column = temporal_group_by.unwrap_or_else(|| self.config.default_temporal_column().clone());
 
+        // do we need to check the input is a table scan?
         log_info!(
             self.log,
             &fingerprint,
@@ -211,6 +226,7 @@ impl fmt::Display for QCAggregatePlanNode {
     }
 }
 
+/// Placeholder for th cached aggregation in the logical plan, there's no logic here, just boilerplate
 impl QCAggregatePlanNode {
     fn new(
         input: LogicalPlan,
@@ -220,6 +236,7 @@ impl QCAggregatePlanNode {
     ) -> DataFusionResult<Self> {
         if let LogicalPlan::Extension(e) = input {
             if let Some(node) = e.node.as_any().downcast_ref::<QCAggregatePlanNode>() {
+                // already a `QCAggregatePlanNode`, return it
                 Ok(node.clone())
             } else {
                 plan_err!("unexpected extension node, expected QCAggregatePlanNode")
@@ -234,7 +251,7 @@ impl QCAggregatePlanNode {
             })
         } else {
             plan_err!(
-                "unexpected input to QCAggregatePlanNode, must be Aggregate or Extension(QCAggregatePlanNode), got {}",
+                "unexpected input to QCAggregatePlanNode, mut be Aggregate or Extension(QCAggregatePlanNode), got {}",
                 input.display()
             )
         }
@@ -269,7 +286,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> DataFusionResult<Self> {
         let mut iter_exprs = exprs.into_iter();
         let Some(Expr::Column(column)) = iter_exprs.next() else {
-            return plan_err!("UserDefinedLogicalNodeCore expected temporal column as first expression");
+            return plan_err!("UserDefinedLogicalNodeCore  expected temporal column as first expressoin");
         };
         let dynamic_lower_bound = if let Some(expr) = iter_exprs.next() {
             if iter_exprs.next().is_some() {
@@ -287,16 +304,18 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
 
         let mut iter_inputs = inputs.into_iter();
         let Some(input) = iter_inputs.next() else {
-            return plan_err!("UserDefinedLogicalNodeCore expected one input");
+            return plan_err!("UserDefinedLogicalNodeCore expected one inputs");
         };
         if iter_inputs.next().is_some() {
-            plan_err!("UserDefinedLogicalNodeCore expected one input")
+            plan_err!("UserDefinedLogicalNodeCore expected one inputs")
         } else {
             Self::new(input, column, dynamic_lower_bound, None)
         }
     }
 }
 
+/// A physical planner that knows how to convert a `QCAggregatePlanNode` into physical plan,
+/// using `QCInnerAggregateExec`.
 #[derive(Debug)]
 pub(crate) struct QCAggregateExecPlanner<Log: AbstractLog> {
     log: Log,
@@ -323,16 +342,19 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
             return Ok(None);
         };
         if physical_inputs.len() != 1 {
+            // maybe Ok(None) is ok here?
             return plan_err!("QueryCacheGroupByExec expected one input");
         }
 
         let exec = physical_inputs[0].clone();
 
         if find_existing_inner_exec(&exec) {
+            // already a `QCInnerAggregateExec` (or contains a `QCInnerAggregateExec`), return it
             return Ok(Some(exec));
         }
 
         let Some(agg_exec): Option<&AggregateExec> = exec.as_any().downcast_ref() else {
+            // should this be an error?
             log_warn!(
                 self.log,
                 &agg_node.fingerprint,
@@ -355,6 +377,7 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
                 .execution_props()
                 .query_execution_start_time
                 .timestamp_nanos_opt()
+                // we'll be in trouble after 2262!
                 .unwrap()
         });
 
@@ -371,6 +394,8 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
             CacheEntry::Vacant(_) => partial_agg_exec,
         };
 
+        // whether or not we had a cache hit, we wrap the input in a `CacheUpdateAggregateExec`
+        // to store the complete (but partial) aggregation
         let input_exec = CacheUpdateAggregateExec::new_exec_plan(cache_entry, input_exec, now);
         let input_schema = input_exec.schema();
 
@@ -385,6 +410,7 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
     }
 }
 
+/// apply a lower bound to an `AggregateExec`
 fn with_lower_bound(
     partial_agg_exec: &Arc<dyn ExecutionPlan>,
     bound_column: &Column,
@@ -449,6 +475,7 @@ fn with_lower_bound(
     )?))
 }
 
+/// check for an existing `QCInnerAggregateExec` in the plan
 fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
     match plan.name() {
         "QueryCacheAggregateExec" => true,
@@ -461,13 +488,19 @@ fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
             find_existing_inner_exec(agg.input())
         }
         _ => false,
+        // name => {
+        //     dbg!(name);
+        //     false
+        // }
     }
 }
 
+/// A wrapper for `AggregateExec` that caches the result of the aggregation
 #[derive(Debug)]
 struct CacheUpdateAggregateExec {
     cache_entry: CacheEntry,
     input: Arc<dyn ExecutionPlan>,
+    /// from `session_state.execution_props().query_execution_start_time.timestamp_nanos_opt()`
     now: i64,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -475,6 +508,8 @@ struct CacheUpdateAggregateExec {
 
 impl CacheUpdateAggregateExec {
     fn new_exec_plan(cache_entry: CacheEntry, input: Arc<dyn ExecutionPlan>, now: i64) -> Arc<dyn ExecutionPlan> {
+        // we need one partition so we can store one result in the cache, use `CoalescePartitionsExec`
+        // if input is not already one
         let input = if input.name() == "CoalescePartitionsExec" {
             input
         } else {
@@ -497,7 +532,6 @@ impl DisplayAs for CacheUpdateAggregateExec {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
             DisplayFormatType::Verbose => write!(f, "{self:?}"),
-            DisplayFormatType::TreeRender => write!(f, "CacheUpdateAggregateExec: TODO TreeRender"), // Added
         }
     }
 }
@@ -526,7 +560,7 @@ impl ExecutionPlan for CacheUpdateAggregateExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
             Ok(Self::new_exec_plan(
-                self.cache_entry.clone(),
+                self.cache_entry.clone(), // TODO is it safe to reuse the cache entry?
                 children[0].clone(),
                 self.now,
             ))
@@ -559,12 +593,14 @@ async fn execute_store(
     metrics: BaselineMetrics,
 ) -> DataFusionResult<Vec<RecordBatch>> {
     let batches = collect(input, context).await?;
+    // store the result for future use
     cache_entry.put(now, &batches).await?;
     metrics.record_output(batches.iter().map(RecordBatch::num_rows).sum());
     metrics.done();
     Ok(batches)
 }
 
+/// A wrapper for `AggregateExec` that caches the result of the aggregation
 #[derive(Debug)]
 struct CachedAggregateExec {
     cache_entry: Arc<dyn OccupiedCacheEntry>,
@@ -592,7 +628,6 @@ impl DisplayAs for CachedAggregateExec {
         match t {
             DisplayFormatType::Default => write!(f, "{}", self.name()),
             DisplayFormatType::Verbose => write!(f, "{self:?}"),
-            DisplayFormatType::TreeRender => write!(f, "CachedAggregateExec: TODO TreeRender"), // Added
         }
     }
 }
@@ -652,11 +687,17 @@ async fn execute_get(
     Ok(batches)
 }
 
+/// Find a binary expression which must have the form `{column} >(=) {something with now()}` represents a
+/// lower bound on `column` but changes over time.
 #[derive(Debug)]
 enum DynamicLowerBound {
+    /// we found an unstable expression which means we can't rewrite the plan
     Abandon,
+    /// we found a suitable lower bound
     Found(BinaryExpr),
+    /// we found `now()` or similar function which is allowed if within an expression which sets the lower bound
     FoundNow,
+    /// we did not find a suitable lower bound, but the expression is stable
     Stable,
 }
 
@@ -679,6 +720,7 @@ impl DynamicLowerBound {
                 _ => Self::Abandon,
             },
             Expr::ScalarFunction(scalar) => Self::find_scalar_function(scalar),
+            // TODO there are other allowed cases
             _ => Self::Abandon,
         }
     }
@@ -687,6 +729,9 @@ impl DynamicLowerBound {
         let BinaryExpr { left, op, right } = bin_expr;
         match op {
             Operator::Gt | Operator::GtEq => {
+                // expression of the form `left >(=) right`, for this to be a lower bound:
+                // `left` must be the column
+                // and `right` must be a dynamic bound
                 if let Expr::Column(col) = left.as_ref() {
                     if columns.contains(col) {
                         return match Self::find(right, columns) {
@@ -698,6 +743,9 @@ impl DynamicLowerBound {
                 }
             }
             Operator::Lt | Operator::LtEq => {
+                // expression of the form `left <(=) right`, for this to be a lower bound:
+                // `left` must be a dynamic bound
+                // and `right` must be the column
                 if let Expr::Column(col) = right.as_ref() {
                     if columns.contains(col) {
                         return match Self::find(left, columns) {
@@ -719,6 +767,7 @@ impl DynamicLowerBound {
                     }
                 }
             }
+            // AND or a simple arithmetic operation, check both sides
             Operator::And
             | Operator::Eq
             | Operator::Plus
@@ -746,9 +795,12 @@ impl DynamicLowerBound {
         }
     }
 
+    /// Find the value which is more important
+    #[allow(clippy::match_same_arms)]
     fn either(self, other: Self) -> Self {
         match (self, other) {
             (Self::Abandon, _) | (_, Self::Abandon) => Self::Abandon,
+            // found on both sides, not sure what to do
             (Self::Found(..), Self::Found(..)) => Self::Abandon,
             (Self::FoundNow, _) | (_, Self::FoundNow) => Self::FoundNow,
             (Self::Stable, other) | (other, Self::Stable) => other,
